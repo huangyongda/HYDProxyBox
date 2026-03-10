@@ -70,7 +70,7 @@ func loadAPIKeys(configPath string) ([]string, error) {
 }
 
 // loadServerConfig 加载服务器配置
-func loadServerConfig(configPath string) (*ServerConfig, error) {
+func loadServerConfig(configPath string) (*AppConfig, error) {
 	configData, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件失败: %v", err)
@@ -85,7 +85,7 @@ func loadServerConfig(configPath string) (*ServerConfig, error) {
 		config.Server.ApiPort = 3000 // 默认端口
 	}
 
-	return &config.Server, nil
+	return &config, nil
 }
 
 // getNextAPIKey 轮询获取下一个 api_key
@@ -178,6 +178,7 @@ func TokenAuthMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			//获取如果当前是/根目录时直接跳转302到另外一个页面
+			fmt.Println("Path:", r.URL.Path)
 			if r.URL.Path == "/" {
 				http.Redirect(w, r, "http://120.24.86.32", http.StatusFound)
 				return
@@ -269,13 +270,14 @@ func main() {
 	}
 
 	// 加载服务器配置
-	serverConfig, err := loadServerConfig("configs/config.yaml")
+	appConfig, err := loadServerConfig("configs/config.yaml")
 	if err != nil {
 		log.Fatalf("加载服务器配置失败: %v", err)
 	}
 
+	serverConfig := appConfig.Server
 	// 目标后端服务地址（例如本地的另一个服务）
-	backend := "https://api.minimaxi.com"
+	backend := appConfig.LLM.APIURL
 
 	// 创建中间件
 	proxyMiddleware := ProxyMiddleware(backend)
