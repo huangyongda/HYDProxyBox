@@ -28,9 +28,17 @@ type LLMConfig struct {
 	ModelMapping map[string]string `yaml:"model_mapping"`
 }
 
+// ServerConfig 服务器配置
+type ServerConfig struct {
+	Host    string `yaml:"host"`
+	Port    int    `yaml:"port"`
+	ApiPort int    `yaml:"api_port"`
+}
+
 // AppConfig 应用配置
 type AppConfig struct {
-	LLM LLMConfig `yaml:"llm"`
+	Server ServerConfig `yaml:"server"`
+	LLM    LLMConfig    `yaml:"llm"`
 }
 
 var (
@@ -59,6 +67,25 @@ func loadAPIKeys(configPath string) ([]string, error) {
 	}
 
 	return config.LLM.APIKeys, nil
+}
+
+// loadServerConfig 加载服务器配置
+func loadServerConfig(configPath string) (*ServerConfig, error) {
+	configData, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取配置文件失败: %v", err)
+	}
+
+	var config AppConfig
+	if err := yaml.Unmarshal(configData, &config); err != nil {
+		return nil, fmt.Errorf("解析配置文件失败: %v", err)
+	}
+
+	if config.Server.ApiPort == 0 {
+		config.Server.ApiPort = 3000 // 默认端口
+	}
+
+	return &config.Server, nil
 }
 
 // getNextAPIKey 轮询获取下一个 api_key
@@ -150,6 +177,11 @@ func checkApikey(token string) error {
 func TokenAuthMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			//获取如果当前是/根目录时直接跳转302到另外一个页面
+			if r.URL.Path == "/" {
+				http.Redirect(w, r, "http://120.24.86.32", http.StatusFound)
+				return
+			}
 			// 提取原始 token
 			hasXApiKey := r.Header.Get("x-api-key")
 			authHeader := r.Header.Get("Authorization")
@@ -236,6 +268,12 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 
+	// 加载服务器配置
+	serverConfig, err := loadServerConfig("configs/config.yaml")
+	if err != nil {
+		log.Fatalf("加载服务器配置失败: %v", err)
+	}
+
 	// 目标后端服务地址（例如本地的另一个服务）
 	backend := "https://api.minimaxi.com"
 
@@ -249,5 +287,7 @@ func main() {
 	handler := tokenAuthMiddleware(proxyMiddleware(http.NotFoundHandler()))
 
 	// 启动代理服务器
-	http.ListenAndServe(":8080", handler)
+	addr := fmt.Sprintf("%s:%d", serverConfig.Host, serverConfig.ApiPort)
+	log.Printf("启动代理服务器，监听地址: %s", addr)
+	log.Fatal(http.ListenAndServe(addr, handler))
 }
