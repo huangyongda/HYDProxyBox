@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,15 +26,24 @@ import (
 	"gorm.io/gorm"
 )
 
-var targetURL string
+var (
+	targetURL string
+	// 重试配置
+	maxRetries        int
+	retryInitialDelay time.Duration
+	retryMaxDelay     time.Duration
+)
 
 // LLMConfig LLM 配置
 type LLMConfig struct {
-	Provider     string            `yaml:"provider"`
-	APIURL       string            `yaml:"api_url"`
-	APIKeys      []string          `yaml:"api_keys"`
-	Timeout      int               `yaml:"timeout"`
-	ModelMapping map[string]string `yaml:"model_mapping"`
+	Provider          string            `yaml:"provider"`
+	APIURL            string            `yaml:"api_url"`
+	APIKeys           []string          `yaml:"api_keys"`
+	Timeout           int               `yaml:"timeout"`
+	ModelMapping      map[string]string `yaml:"model_mapping"`
+	MaxRetries        int               `yaml:"max_retries"`
+	RetryInitialDelay int               `yaml:"retry_initial_delay"`
+	RetryMaxDelay     int               `yaml:"retry_max_delay"`
 }
 
 // ServerConfig 服务器配置
@@ -47,6 +57,18 @@ type ServerConfig struct {
 type AppConfig struct {
 	Server ServerConfig `yaml:"server"`
 	LLM    LLMConfig    `yaml:"llm"`
+}
+
+// APIErrorResponse API错误响应结构
+type APIErrorResponse struct {
+	Error     APIErrorDetail `json:"error"`
+	RequestID string         `json:"request_id,omitempty"`
+}
+
+// APIErrorDetail 错误详情
+type APIErrorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 var (
@@ -91,6 +113,17 @@ func loadServerConfig(configPath string) (*AppConfig, error) {
 
 	if config.Server.ApiPort == 0 {
 		config.Server.ApiPort = 3000 // 默认端口
+	}
+
+	// 设置重试配置默认值
+	if config.LLM.MaxRetries == 0 {
+		config.LLM.MaxRetries = 3
+	}
+	if config.LLM.RetryInitialDelay == 0 {
+		config.LLM.RetryInitialDelay = 1000 // 1秒
+	}
+	if config.LLM.RetryMaxDelay == 0 {
+		config.LLM.RetryMaxDelay = 10000 // 10秒
 	}
 
 	return &config, nil
@@ -195,6 +228,11 @@ func main() {
 
 	targetURL = appConfig.LLM.APIURL
 
+	// 设置重试配置
+	maxRetries = appConfig.LLM.MaxRetries
+	retryInitialDelay = time.Duration(appConfig.LLM.RetryInitialDelay) * time.Millisecond
+	retryMaxDelay = time.Duration(appConfig.LLM.RetryMaxDelay) * time.Millisecond
+
 	serverConfig := appConfig.Server
 	// // 启动代理服务器
 	addr := fmt.Sprintf("%s:%d", serverConfig.Host, serverConfig.ApiPort)
@@ -207,6 +245,82 @@ func main() {
 
 	r.Run(addr)
 
+}
+
+// shouldRetry 判断是否应该重试（非流式响应）
+func shouldRetry(responseStr string, statusCode int) bool {
+	if statusCode != http.StatusOK {
+		return false
+	}
+
+	var apiError APIErrorResponse
+	if err := json.Unmarshal([]byte(responseStr), &apiError); err != nil {
+		return false
+	}
+
+	return apiError.Error.Code == "1305"
+}
+
+// shouldRetryStream 检测流式响应前2个chunk是否包含错误
+func shouldRetryStream(combined string) bool {
+	// 尝试从 SSE 格式中提取 JSON 内容
+	// SSE 格式通常是: "data: {...}\n\n"
+	lines := strings.Split(combined, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "data:") {
+			jsonStr := strings.TrimPrefix(line, "data:")
+			jsonStr = strings.TrimSpace(jsonStr)
+
+			var apiError APIErrorResponse
+			if err := json.Unmarshal([]byte(jsonStr), &apiError); err == nil {
+				if apiError.Error.Code == "1305" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// executeWithRetry 带重试的HTTP请求执行
+func executeWithRetry(c *gin.Context, req *http.Request, maxRetries int, initialDelay, maxDelay time.Duration) (bool, string, string, int) {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// 指数退避延迟
+			delay := time.Duration(int(initialDelay) * (1 << (attempt - 1)))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			log.Printf("重试第 %d 次，等待 %v 后重试", attempt, delay)
+			time.Sleep(delay)
+
+			// 重新构建请求（可能需要新的API key）
+			apiKey, err := getNextAPIKey()
+			if err != nil {
+				log.Printf("重试时获取 API key 失败: %v", err)
+			} else {
+				hasXApiKey := c.Request.Header.Get("x-api-key") != ""
+				if hasXApiKey {
+					req.Header.Set("x-api-key", apiKey)
+				} else {
+					req.Header.Set("Authorization", "Bearer "+apiKey)
+				}
+			}
+		}
+
+		isStream, encoding, responseStr, statusCode, needRetry := httpRequest(c, req)
+
+		// 使用 needRetry 标志判断
+		if !needRetry {
+			return isStream, encoding, responseStr, statusCode
+		}
+
+		log.Printf("检测到可重试错误 (1305)，准备重试")
+	}
+
+	log.Printf("达到最大重试次数 %d", maxRetries)
+	return false, "", "", http.StatusInternalServerError
 }
 
 func proxyHandler(c *gin.Context) {
@@ -272,7 +386,8 @@ func proxyHandler(c *gin.Context) {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Del("x-api-key")
 	}
-	isStream, encoding, responseStr, statusCode := httpRequest(c, req)
+	// 使用重试逻辑执行请求
+	isStream, encoding, responseStr, statusCode := executeWithRetry(c, req, maxRetries, retryInitialDelay, retryMaxDelay)
 	if statusCode != http.StatusOK {
 		c.JSON(statusCode, gin.H{"error": "request failed"})
 		return
@@ -319,7 +434,7 @@ func decrypt(encoding string, content string) (string, error) {
 	return responseBody, nil
 }
 
-func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, responseStr string, statusCode int) {
+func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, responseStr string, statusCode int, needRetry bool) {
 	// 创建新请求
 
 	client := &http.Client{
@@ -354,21 +469,21 @@ func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, re
 	}
 
 	if strings.Contains(contentType, "text/event-stream") {
-		responseStr = handleStream(c, resp, startTime)
+		responseStr, needRetry = handleStream(c, resp, startTime)
 		isStream = true
 	} else {
-		responseStr = handleNormal(c, resp)
+		responseStr, needRetry = handleNormal(c, resp)
 		isStream = false
 	}
-	return isStream, encoding, responseStr, resp.StatusCode
+	return isStream, encoding, responseStr, resp.StatusCode, needRetry
 }
 
-func handleNormal(c *gin.Context, resp *http.Response) (responseStr string) {
+func handleNormal(c *gin.Context, resp *http.Response) (responseStr string, needRetry bool) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// c.JSON(500, gin.H{"error": "read resp failed"})
 		fmt.Println("读取响应内容失败:", err)
-		return
+		return "", false
 	}
 
 	// ====== 日志记录（响应）======
@@ -376,16 +491,19 @@ func handleNormal(c *gin.Context, resp *http.Response) (responseStr string) {
 	// log.Println(string(body))
 	responseStr = string(body)
 	// c.Writer.Write(body)
-	return responseStr
+
+	// 检测是否需要重试
+	needRetry = shouldRetry(responseStr, resp.StatusCode)
+	return responseStr, needRetry
 }
 
-func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (respStr string) {
+func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (respStr string, needRetry bool) {
 	reader := bufio.NewReader(resp.Body)
 
 	flusher, ok := c.Writer.(http.Flusher)
 	if !ok {
 		c.JSON(500, gin.H{"error": "stream not supported"})
-		return
+		return "", false
 	}
 
 	c.Writer.Header().Set("Content-Type", "text/event-stream")
@@ -393,31 +511,60 @@ func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (r
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("Transfer-Encoding", "chunked")
 
+	// 预检测阶段：读取前2个chunk
+	var firstChunks []string
+	chunkCount := 0
+	for chunkCount < 2 {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Println("预检测阶段读取错误:", err)
+			}
+			break
+		}
+		if len(line) > 0 {
+			firstChunks = append(firstChunks, string(line))
+			chunkCount++
+		}
+	}
+
+	// 检测前2个chunk是否包含错误
+	combined := strings.Join(firstChunks, "")
+	if shouldRetryStream(combined) {
+		return combined, true // 需要重试
+	}
+
 	// 指标统计
 	var firstTokenTime time.Time
-	// var tokenCount int
 	firstTokenReceived := false
 	ttft := time.Duration(0)
 
+	// 先发送已读取的前2个chunk
+	for _, chunk := range firstChunks {
+		if !firstTokenReceived && len(chunk) > 4 {
+			firstTokenTime = time.Now()
+			firstTokenReceived = true
+			ttft = firstTokenTime.Sub(streamStart)
+		}
+		respStr += chunk
+		c.Writer.Write([]byte(chunk))
+		flusher.Flush()
+	}
+
+	// 继续读取剩余的流
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			lineStr := string(line)
 
-			// 记录首 token 延迟（首个非空数据块）
 			if !firstTokenReceived && len(lineStr) > 4 {
 				firstTokenTime = time.Now()
 				firstTokenReceived = true
 				ttft = firstTokenTime.Sub(streamStart)
-				// log.Printf("[METRICS] 首token延迟 (TTFT): %v", ttft)
 			}
 
-			// ====== 日志（流式）======
-			// log.Print(lineStr)
-
 			respStr += lineStr
-
-			_, _ = c.Writer.Write(line)
+			c.Writer.Write(line)
 			flusher.Flush()
 		}
 
@@ -431,7 +578,7 @@ func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (r
 
 	log.Printf("  首字 %v", ttft)
 
-	return respStr
+	return respStr, false // 不需要重试
 }
 
 func copyHeaders(src http.Header, dst http.Header) {
