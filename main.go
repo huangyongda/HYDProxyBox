@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
@@ -182,110 +181,6 @@ func checkApikey(token string) error {
 	return nil
 }
 
-// TokenAuthMiddleware 返回一个中间件，用于验证原始 token
-func TokenAuthMiddleware() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			//获取如果当前是/根目录时直接跳转302到另外一个页面
-			fmt.Println("Path:", r.URL.Path)
-			if r.URL.Path == "/" {
-				http.Redirect(w, r, "http://120.24.86.32", http.StatusFound)
-				return
-			}
-			// 提取原始 token
-			hasXApiKey := r.Header.Get("x-api-key")
-			authHeader := r.Header.Get("Authorization")
-			orgtoken := ""
-			if authHeader != "" {
-				orgtoken = authHeader
-				//Bearer 去掉
-				orgtoken = orgtoken[7:]
-			} else if hasXApiKey != "" {
-				orgtoken = hasXApiKey
-			}
-
-			if strings.Contains(orgtoken, "wLDPWipw") {
-				// token 无效，返回错误响应
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				w.Write([]byte(fmt.Sprintf(`{"type":"error","error":{"type":"rate_limit_error","message":"当前处于高峰时段，Token Plan 的速率限制可能会临时收紧。请稍后重试，并请适当控制请求并发度。 (2062)","http_code":"429"},"request_id":"0612d1859464bc04afea711ef3fdbf1d"}`)))
-				// w.Write([]byte(`{"error": "invalid token or expired "}`))
-				return
-			}
-
-			// // 调用 checkApikey 验证
-			// if err := checkApikey(orgtoken); err != nil {
-			// 	// token 无效，返回错误响应
-			// 	w.Header().Set("Content-Type", "application/json")
-			// 	w.WriteHeader(http.StatusUnauthorized)
-			// 	errorMsg := err
-			// 	w.Write([]byte(fmt.Sprintf(`{"error": "%s"}`, errorMsg)))
-			// 	// w.Write([]byte(`{"error": "invalid token or expired "}`))
-			// 	return
-			// }
-
-			// token 有效，继续处理请求
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-// ProxyMiddleware 返回一个中间件，将请求代理到 target 后端，并修改 apikey 头
-func ProxyMiddleware(target string) func(http.Handler) http.Handler {
-	// 解析后端地址（实际使用中应处理错误）
-	targetURL, _ := url.Parse(target)
-
-	// 创建反向代理
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.ErrorLog = log.New(os.Stderr, "", 0)
-
-	// 保存默认的 Director，以便先执行必要的 URL/Host 改写
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-
-		originalDirector(req) // 先执行默认的 Director（重写 URL 和 Host）
-
-		// 确保 Host header 也被修改为目标后端
-		// req.Host = targetURL.Host
-
-		// // 轮询获取下一个 api_key
-		// apiKey, err := getNextAPIKey()
-		// if err != nil {
-		// 	log.Printf("获取 api_key 失败: %v", err)
-		// 	return
-		// }
-		// fmt.Println("使用 api_key:", apiKey)
-
-		// 修改 apikey 头为轮询获取的值
-		// req.Header.Set("Authorization", "Bearer "+apiKey)
-		// req.Header.Set("apikey", apiKey)
-
-		// 打印实际发送的请求（调试用）
-		// dump, _ := httputil.DumpRequestOut(req, true)
-		// log.Printf("发送的请求:\n%s", string(dump))
-		// 其他 Header 保持不变
-	}
-
-	// 打印响应状态码
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		log.Printf("响应状态码: %d %s", resp.StatusCode, resp.Status)
-		// 打印响应内容
-		// dump, _ := httputil.DumpResponse(resp, true)
-		// log.Printf("响应内容:\n%s", string(dump))
-		// log.Printf("响应头:\n%s", resp.Header)
-
-		return nil
-	}
-
-	// 返回中间件函数
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 直接使用反向代理处理请求，不调用 next
-			proxy.ServeHTTP(w, r)
-		})
-	}
-}
-
 func main() {
 	// 初始化数据库连接
 	if err := database.Init("configs/config.yaml"); err != nil {
@@ -301,21 +196,9 @@ func main() {
 	targetURL = appConfig.LLM.APIURL
 
 	serverConfig := appConfig.Server
-	// // 目标后端服务地址（例如本地的另一个服务）
-	// backend := appConfig.LLM.APIURL
-
-	// // 创建中间件
-	// proxyMiddleware := ProxyMiddleware(backend)
-
-	// // 添加 token 验证中间件
-	// tokenAuthMiddleware := TokenAuthMiddleware()
-
-	// // 应用中间件链
-	// handler := tokenAuthMiddleware(proxyMiddleware(http.NotFoundHandler()))
-
 	// // 启动代理服务器
 	addr := fmt.Sprintf("%s:%d", serverConfig.Host, serverConfig.ApiPort)
-	// log.Printf("启动代理服务器，监听地址: %s", addr)
+	log.Printf("启动代理服务器，监听地址: %s", addr)
 	// log.Fatal(http.ListenAndServe(addr, handler))
 
 	r := gin.Default()
@@ -402,6 +285,7 @@ func proxyHandler(c *gin.Context) {
 	if isStream == false {
 		fmt.Println("响应内容:", responseStr)
 	}
+	//{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"},"request_id":"202604081407415956ef68960146c8"}
 
 	fmt.Println("响应状态码:", statusCode, ",响应内容:", responseStr)
 
@@ -441,10 +325,11 @@ func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, re
 	client := &http.Client{
 		Timeout: 0, // 流式必须关闭超时
 		//代理
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-		},
+		// Transport: &http.Transport{
+		// 	Proxy: http.ProxyFromEnvironment,
+		// },
 	}
+	startTime := time.Now()
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -469,7 +354,7 @@ func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, re
 	}
 
 	if strings.Contains(contentType, "text/event-stream") {
-		responseStr = handleStream(c, resp)
+		responseStr = handleStream(c, resp, startTime)
 		isStream = true
 	} else {
 		responseStr = handleNormal(c, resp)
@@ -481,20 +366,20 @@ func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, re
 func handleNormal(c *gin.Context, resp *http.Response) (responseStr string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "read resp failed"})
+		// c.JSON(500, gin.H{"error": "read resp failed"})
+		fmt.Println("读取响应内容失败:", err)
 		return
 	}
 
 	// ====== 日志记录（响应）======
-	log.Println("==== RESPONSE ====")
-	log.Println(string(body))
+	// log.Println("==== RESPONSE ====")
+	// log.Println(string(body))
 	responseStr = string(body)
-	c.Writer.Write(body)
+	// c.Writer.Write(body)
 	return responseStr
 }
 
-func handleStream(c *gin.Context, resp *http.Response) (respStr string) {
-
+func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (respStr string) {
 	reader := bufio.NewReader(resp.Body)
 
 	flusher, ok := c.Writer.(http.Flusher)
@@ -507,16 +392,30 @@ func handleStream(c *gin.Context, resp *http.Response) (respStr string) {
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("Transfer-Encoding", "chunked")
-	//Transfer-Encoding: chunked
-	// Connection: keep-alive
+
+	// 指标统计
+	var firstTokenTime time.Time
+	// var tokenCount int
+	firstTokenReceived := false
+	ttft := time.Duration(0)
 
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			// ====== 日志（流式）======
-			log.Print(string(line))
+			lineStr := string(line)
 
-			respStr += string(line)
+			// 记录首 token 延迟（首个非空数据块）
+			if !firstTokenReceived && len(lineStr) > 4 {
+				firstTokenTime = time.Now()
+				firstTokenReceived = true
+				ttft = firstTokenTime.Sub(streamStart)
+				// log.Printf("[METRICS] 首token延迟 (TTFT): %v", ttft)
+			}
+
+			// ====== 日志（流式）======
+			// log.Print(lineStr)
+
+			respStr += lineStr
 
 			_, _ = c.Writer.Write(line)
 			flusher.Flush()
@@ -529,6 +428,9 @@ func handleStream(c *gin.Context, resp *http.Response) (respStr string) {
 			break
 		}
 	}
+
+	log.Printf("  首字 %v", ttft)
+
 	return respStr
 }
 
