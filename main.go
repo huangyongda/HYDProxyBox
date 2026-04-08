@@ -283,6 +283,28 @@ func shouldRetryStream(combined string) bool {
 	return false
 }
 
+// 综合处理函数
+func NormalizeLogLine(log string) string {
+	if log == "" {
+		return ""
+	}
+
+	// 1. 替换所有换行符为空格
+	result := strings.ReplaceAll(log, "\r\n", " ")
+	result = strings.ReplaceAll(result, "\n", " ")
+	result = strings.ReplaceAll(result, "\r", " ")
+
+	// 2. 合并连续的空格
+	for strings.Contains(result, "  ") {
+		result = strings.ReplaceAll(result, "  ", " ")
+	}
+
+	// 3. 去除首尾空格
+	result = strings.TrimSpace(result)
+
+	return result
+}
+
 // executeWithRetry 带重试的HTTP请求执行
 func executeWithRetry(c *gin.Context, req *http.Request, maxRetries int, initialDelay, maxDelay time.Duration) (bool, string, string, int) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -402,7 +424,7 @@ func proxyHandler(c *gin.Context) {
 	}
 	//{"error":{"code":"1305","message":"该模型当前访问量过大，请您稍后再试"},"request_id":"202604081407415956ef68960146c8"}
 
-	fmt.Println("响应状态码:", statusCode, ",响应内容:", responseStr)
+	fmt.Println("响应状态码:", statusCode, ",响应内容:", NormalizeLogLine(responseStr))
 
 	log.Println("耗时:", time.Since(start))
 }
