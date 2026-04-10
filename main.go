@@ -71,6 +71,20 @@ type APIErrorDetail struct {
 	Message string `json:"message"`
 }
 
+//请求结构体
+//	//{"model":"GLM-5.1","messages":[{"role":"user","content":[{"type":"text","text":"请将下面内容翻译成英文"}]}]}
+
+type RequestBody struct {
+	Model    string `json:"model"`
+	Messages []struct {
+		Role    string `json:"role"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"messages"`
+}
+
 var (
 	mu          sync.RWMutex // 1. 读写锁，保护配置数据
 	lastLoad    time.Time    // 记录上次加载时间
@@ -279,6 +293,9 @@ func shouldRetryStream(combined string) bool {
 				}
 			}
 		}
+		if strings.Contains(line, "400 Bad Request") {
+			return true
+		}
 	}
 	return false
 }
@@ -307,6 +324,9 @@ func NormalizeLogLine(log string) string {
 
 // executeWithRetry 带重试的HTTP请求执行
 func executeWithRetry(c *gin.Context, req *http.Request, maxRetries int, initialDelay, maxDelay time.Duration) (bool, string, string, int) {
+	requestID := time.Now().Format("20060102150405.000")
+	log.Printf("[%s] 开始执行请求，最大重试次数: %d", requestID, maxRetries)
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			// 指数退避延迟
@@ -314,13 +334,13 @@ func executeWithRetry(c *gin.Context, req *http.Request, maxRetries int, initial
 			if delay > maxDelay {
 				delay = maxDelay
 			}
-			log.Printf("重试第 %d 次，等待 %v 后重试", attempt, delay)
+			log.Printf("[%s] 重试第 %d 次，等待 %v 后重试", requestID, attempt, delay)
 			time.Sleep(delay)
 
 			// 重新构建请求（可能需要新的API key）
 			apiKey, err := getNextAPIKey()
 			if err != nil {
-				log.Printf("重试时获取 API key 失败: %v", err)
+				log.Printf("[%s] 重试时获取 API key 失败: %v", requestID, err)
 			} else {
 				hasXApiKey := c.Request.Header.Get("x-api-key") != ""
 				if hasXApiKey {
@@ -331,29 +351,56 @@ func executeWithRetry(c *gin.Context, req *http.Request, maxRetries int, initial
 			}
 		}
 
+		log.Printf("[%s] 执行第 %d 次尝试", requestID, attempt+1)
 		isStream, encoding, responseStr, statusCode, needRetry := httpRequest(c, req)
+
+		if statusCode != http.StatusOK {
+			log.Printf("[%s] 请求失败，返回内容: %s", requestID, NormalizeLogLine(responseStr))
+		}
+
+		if needRetry {
+			log.Printf("[%s] 检测到可重试错误 (1305)，准备重试,返回内容: %s", requestID, NormalizeLogLine(responseStr))
+		}
+
+		log.Printf("[%s] 第 %d 次尝试完成: statusCode=%d, needRetry=%v", requestID, attempt+1, statusCode, needRetry)
 
 		// 使用 needRetry 标志判断
 		if !needRetry {
+			log.Printf("[%s] 请求成功，无需重试", requestID)
 			return isStream, encoding, responseStr, statusCode
 		}
 
-		log.Printf("检测到可重试错误 (1305)，准备重试")
+		log.Printf("[%s] 检测到可重试错误 ，准备重试,返回内容: %s", requestID, NormalizeLogLine(responseStr))
 	}
 
-	log.Printf("达到最大重试次数 %d", maxRetries)
+	log.Printf("[%s] 达到最大重试次数 %d", requestID, maxRetries)
 	return false, "", "", http.StatusInternalServerError
 }
 
 func proxyHandler(c *gin.Context) {
 	start := time.Now()
+	requestID := time.Now().Format("20060102150405.000")
+	log.Printf("[%s] ========== 新请求开始 ==========", requestID)
 
-	// 读取请求 body
+	//{"model":"GLM-5.1","messages":[{"role":"user","content":[{"type":"text","text":"请将下面内容翻译成英文"}]}]}
 	bodyBytes, err := io.ReadAll(c.Request.Body)
+	// fmt.Println("请求参数:", string(bodyBytes))
 	if err != nil {
+		log.Printf("[%s] 读取请求体失败: %v", requestID, err)
 		c.JSON(500, gin.H{"error": "read body failed"})
 		return
 	}
+
+	// 保存 curl 命令到日志文件
+	saveCurlLog(c, string(bodyBytes))
+
+	// 第一次解析
+	var param1 RequestBody
+	if err := json.Unmarshal(bodyBytes, &param1); err != nil {
+		c.JSON(400, gin.H{"error": "parse json failed"})
+		return
+	}
+	fmt.Println("请求model:", param1.Model)
 
 	// ===== 判断类型 =====
 	hasXApiKey := c.Request.Header.Get("x-api-key") != ""
@@ -380,8 +427,8 @@ func proxyHandler(c *gin.Context) {
 	fmt.Println("请求地址:", url.String())
 
 	// ====== 日志记录（请求）======
-	log.Println("==== REQUEST ====")
-	log.Println(string(bodyBytes))
+	// log.Println("==== REQUEST ====")
+	// log.Println(string(bodyBytes))
 
 	req, err := http.NewRequest("POST", url.String(), bytes.NewBuffer(bodyBytes))
 	if err != nil {
@@ -426,7 +473,8 @@ func proxyHandler(c *gin.Context) {
 
 	fmt.Println("响应状态码:", statusCode, ",响应内容:", NormalizeLogLine(responseStr))
 
-	log.Println("耗时:", time.Since(start))
+	log.Printf("[%s] 请求完成，总耗时: %v", requestID, time.Since(start))
+	log.Printf("[%s] ========== 请求结束 ==========", requestID)
 }
 
 // 解密http内容
@@ -475,20 +523,9 @@ func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, re
 	}
 	defer resp.Body.Close()
 
-	// ====== 返回 header ======
-	copyHeaders(resp.Header, c.Writer.Header())
-	c.Status(resp.StatusCode)
-
 	// 判断是否是流式
 	contentType := resp.Header.Get("Content-Type")
 	encoding = resp.Header.Get("Content-Encoding")
-	// 打印header
-	log.Println("响应头:")
-	for key, values := range resp.Header {
-		for _, value := range values {
-			log.Printf("%s: %s\n", key, value)
-		}
-	}
 
 	if strings.Contains(contentType, "text/event-stream") {
 		responseStr, needRetry = handleStream(c, resp, startTime)
@@ -497,6 +534,20 @@ func httpRequest(c *gin.Context, req *http.Request) (isStream bool, encoding, re
 		responseStr, needRetry = handleNormal(c, resp)
 		isStream = false
 	}
+
+	// 只有在确定不需要重试时才设置响应头和状态码
+	if !needRetry {
+		copyHeaders(resp.Header, c.Writer.Header())
+		// 对于流式响应，需要额外设置这些响应头
+		if isStream {
+			c.Writer.Header().Set("Content-Type", "text/event-stream")
+			c.Writer.Header().Set("Cache-Control", "no-cache")
+			c.Writer.Header().Set("Connection", "keep-alive")
+			c.Writer.Header().Set("Transfer-Encoding", "chunked")
+		}
+		c.Status(resp.StatusCode)
+	}
+
 	return isStream, encoding, responseStr, resp.StatusCode, needRetry
 }
 
@@ -522,17 +573,6 @@ func handleNormal(c *gin.Context, resp *http.Response) (responseStr string, need
 func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (respStr string, needRetry bool) {
 	reader := bufio.NewReader(resp.Body)
 
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		c.JSON(500, gin.H{"error": "stream not supported"})
-		return "", false
-	}
-
-	c.Writer.Header().Set("Content-Type", "text/event-stream")
-	c.Writer.Header().Set("Cache-Control", "no-cache")
-	c.Writer.Header().Set("Connection", "keep-alive")
-	c.Writer.Header().Set("Transfer-Encoding", "chunked")
-
 	// 预检测阶段：读取前2个chunk
 	var firstChunks []string
 	chunkCount := 0
@@ -556,10 +596,19 @@ func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (r
 		return combined, true // 需要重试
 	}
 
+	// 确认不需要重试，现在可以设置响应头和发送数据了
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(500, gin.H{"error": "stream not supported"})
+		return "", false
+	}
+
 	// 指标统计
 	var firstTokenTime time.Time
 	firstTokenReceived := false
 	ttft := time.Duration(0)
+
+	//响应状态码: 200 ,响应内容: event: error data: {"error":{"code":"1302","message":"您的账户已达到速率限制，请您控制请求频率"},"request_id":"202604101201442801705ab7c647cb"} data: [DONE]
 
 	// 先发送已读取的前2个chunk
 	for _, chunk := range firstChunks {
@@ -584,6 +633,7 @@ func handleStream(c *gin.Context, resp *http.Response, streamStart time.Time) (r
 				firstTokenReceived = true
 				ttft = firstTokenTime.Sub(streamStart)
 			}
+			fmt.Println("打印:", lineStr)
 
 			respStr += lineStr
 			c.Writer.Write(line)
@@ -608,5 +658,67 @@ func copyHeaders(src http.Header, dst http.Header) {
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
+	}
+}
+
+// saveCurlLog 将请求保存为 curl 命令格式到日志文件
+func saveCurlLog(c *gin.Context, body string) {
+	var curlCmd strings.Builder
+
+	// 基本信息
+	curlCmd.WriteString(fmt.Sprintf("Time: %s\n", time.Now().Format("2006-01-02 15:04:05")))
+	curlCmd.WriteString(fmt.Sprintf("Method: %s\n", c.Request.Method))
+	curlCmd.WriteString(fmt.Sprintf("URL: %s%s\n", c.Request.Host, c.Request.URL.Path))
+	if c.Request.URL.RawQuery != "" {
+		curlCmd.WriteString(fmt.Sprintf("Query: ?%s\n", c.Request.URL.RawQuery))
+	}
+
+	curlCmd.WriteString("\n")
+
+	// Curl 命令
+	curlCmd.WriteString("Curl Command:\n")
+
+	// 构建 URL
+	requestURL := fmt.Sprintf("http://%s%s", c.Request.Host, c.Request.URL.Path)
+	if c.Request.URL.RawQuery != "" {
+		requestURL = fmt.Sprintf("%s?%s", requestURL, c.Request.URL.RawQuery)
+	}
+
+	curlCmd.WriteString("curl -X POST \\")
+	curlCmd.WriteString(fmt.Sprintf("\n  '%s'", requestURL))
+
+	// 添加 headers
+	for key, values := range c.Request.Header {
+		for _, value := range values {
+			// 隐藏敏感信息
+			curlCmd.WriteString(fmt.Sprintf(" \\\n  -H '%s: %s'", key, value))
+		}
+	}
+
+	// 添加 body
+	if body != "" {
+		// 转义单引号并格式化
+		escapedBody := strings.ReplaceAll(body, "'", "'\\''")
+		curlCmd.WriteString(fmt.Sprintf(" \\\n  -d '%s'", escapedBody))
+	}
+	curlCmd.WriteString("\n")
+
+	// 写入文件
+	f, err := os.OpenFile("curl_log.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("打开 curl_log.txt 失败: %v", err)
+		return
+	}
+	defer f.Close()
+
+	// 分隔符
+	if _, err := f.WriteString("\n" + strings.Repeat("=", 80) + "\n"); err != nil {
+		log.Printf("写入分隔符失败: %v", err)
+		return
+	}
+
+	if _, err := f.WriteString(curlCmd.String()); err != nil {
+		log.Printf("写入 curl 日志失败: %v", err)
+		return
 	}
 }
